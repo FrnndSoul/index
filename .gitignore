@@ -19,3 +19,6 @@ resources/__pycache__/
 .vscode/
 .DS_Store
 *.swp
+
+mkdir -p resources/history
+touch resources/history/.gitkeep
