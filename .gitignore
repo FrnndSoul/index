@@ -1,0 +1,21 @@
+# --- Ignore history inside resources, but keep the folder
+resources/history/**
+!resources/history/.gitkeep
+
+# --- Ignore Python bytecode caches
+resources/__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Ignore SQLite databases anywhere (and sidecars)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# --- Optional editor/system noise
+.vscode/
+.DS_Store
+*.swp
