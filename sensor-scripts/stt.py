@@ -5,6 +5,9 @@ import importlib.util, pathlib, sys
 HERE = pathlib.Path(__file__).resolve().parent
 TTS_FILE = HERE / "text-to-speech.py"
 
+# in sensor-scripts/text-to-speech.py (top of file)
+LT_URL = os.environ.get("LT_URL") or "http://127.0.0.1:5005/translate"
+
 spec = importlib.util.spec_from_file_location("sensor_tts", TTS_FILE)
 if not spec or not spec.loader:
     raise ImportError(f"Cannot import {TTS_FILE}")
