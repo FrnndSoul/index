@@ -48,6 +48,7 @@ ALIASES = {
     "gps":        "gps.py",
     "acc":        "accelerometer.py",
     "tts":        "text-to-speech.py",
+    "stt":        "stt.py",
     "cam":        "camera.py",
 }
 

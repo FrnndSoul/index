@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from functools import lru_cache
 from flask import send_file
+import requests
 
 try:
     from gtts import gTTS
@@ -27,6 +28,9 @@ except Exception:
     sd = None
     Model = None
     KaldiRecognizer = None
+
+# in sensor-scripts/text-to-speech.py (top of file)
+LT_URL = os.environ.get("LT_URL") or "http://127.0.0.1:5005/translate"
 
 _BUZZER_PIN = 18
 _buzzer_kind = None
@@ -289,11 +293,8 @@ def _run_beep_sync(sock_path: str, mp3_duration_s: float, toks: list[str], bad_i
         return
     if rate <= 0:
         rate = 1.0
-    # Playback duration scales with speed
     duration = (mp3_duration_s or 0.0) / rate
-
     if duration <= 0:
-        # try ask mpv
         for _ in range(40):
             resp = _mpv_get_property(sock_path, "duration")
             if resp and resp.get("error") == "success" and isinstance(resp.get("data"), (int,float)):
@@ -302,20 +303,15 @@ def _run_beep_sync(sock_path: str, mp3_duration_s: float, toks: list[str], bad_i
             time.sleep(0.05)
         if duration <= 0:
             return
-
-    # Build cumulative start times per token
     def _w(tok: str) -> int:
         return max(1, len(re.sub(r"[^A-Za-z0-9]+","", tok)))
     weights = [_w(t) for t in toks]
     total_w = max(1, sum(weights))
-
     starts = []
     acc = 0.0
     for w in weights:
         starts.append((acc / total_w) * duration)
         acc += w
-
-    # Poll faster (50 Hz) and fire with a small negative lead
     fired = set()
     last_pos = -1.0
     while True:
@@ -329,7 +325,6 @@ def _run_beep_sync(sock_path: str, mp3_duration_s: float, toks: list[str], bad_i
         if pos is None:
             time.sleep(0.02)
             continue
-
         for idx in bad_indices:
             if idx in fired:
                 continue
@@ -338,7 +333,6 @@ def _run_beep_sync(sock_path: str, mp3_duration_s: float, toks: list[str], bad_i
                 ms = _estimate_ms_for_token(idx, toks, duration)
                 _buzz_api(ms=ms)
                 fired.add(idx)
-
         last_pos = pos
         if len(fired) >= len(bad_indices):
             break
@@ -346,14 +340,91 @@ def _run_beep_sync(sock_path: str, mp3_duration_s: float, toks: list[str], bad_i
             break
         time.sleep(0.02)
 
+def _lt_norm(code: str) -> str:
+    c = (code or "").lower()
+    if not c: return ""
+    c = c.replace("_","-")
+    if c.startswith("en"): return "en"
+    # was "fil"; must be "tl" for LibreTranslate
+    if c in ("tl","fil","fil-ph","tl-ph","tagalog"): return "tl"
+    return c.split("-")[0]
+
+
+def _translate_text(text: str, src: str, dst: str) -> str:
+    if not text or not LT_URL:
+        return text
+    s, t = _lt_norm(src), _lt_norm(dst)
+    if not t or s == t:
+        return text
+    try:
+        r = requests.post(LT_URL, json={"q": text, "source": s or "auto", "target": t, "format": "text"}, timeout=10)
+        r.raise_for_status()
+        j = r.json()
+        out = (j.get("translatedText") or j.get("translated_text") or text)
+        print(f"[translate] {s or 'auto'} -> {t}: {text!r} => {out!r}")
+        return out
+    except Exception as e:
+        print(f"[translate] error ({s}->{t}): {e}")
+        return text
+
+def api_out_langs(CTX: dict, **params):
+    if not LT_URL:
+        # Fallback minimal set if LT_URL isn't configured
+        return [{"code":"en","name":"English"},{"code":"fil","name":"Filipino"}]
+    base = LT_URL.rstrip("/").rsplit("/", 1)[0] + "/languages"
+    try:
+        r = requests.get(base, timeout=5)
+        r.raise_for_status()
+        items = r.json()
+        # items usually look like [{"code":"en","name":"English"}, ...]
+        # Normalize Tagalog/Filipino code to "fil" to match _lt_norm()
+        out = []
+        for it in items:
+            code = (it.get("code") or "").lower()
+            name = it.get("name") or code
+            if code in ("tl","tagalog"):
+                code = "fil"
+                name = "Filipino"
+            out.append({"code": code, "name": name})
+        # Pin common ones to the top
+        pin = ["fil","en"]
+        for p in reversed(pin):
+            i = next((k for k, x in enumerate(out) if x["code"] == p), None)
+            if i is not None:
+                out.insert(0, out.pop(i))
+        return out
+    except Exception:
+        return [{"code":"en","name":"English"},{"code":"fil","name":"Filipino"}]
+
 def api_langs(CTX: dict, **params):
+    include_providers = str(params.get("providers", "")).lower() in ("1","true","yes")
     langs = tts_langs()
     items = [{"code": c, "name": n} for c, n in langs.items()]
+    ph_locales = [
+        {"code": "en-PH",  "name": "English (Philippines)",           "provider": "azure"},
+        {"code": "fil-PH", "name": "Filipino (Philippines)",          "provider": "azure",
+         "voices": ["fil-PH-AngeloNeural", "fil-PH-BlessicaNeural"]},
+        {"code": "ceb-PH", "name": "Cebuano (Bisaya)",                 "provider": "espeak-ng"},
+        {"code": "ilo-PH", "name": "Ilocano",                          "provider": "espeak-ng"},
+        {"code": "pam-PH", "name": "Kapampangan",                      "provider": "espeak-ng"},
+        {"code": "hil-PH", "name": "Hiligaynon",                       "provider": "espeak-ng"},
+        {"code": "war-PH", "name": "Waray",                            "provider": "espeak-ng"},
+    ]
+    if not include_providers:
+        ph_locales = [{"code": x["code"], "name": x["name"]} for x in ph_locales]
+    have = {it["code"] for it in items}
+    for x in ph_locales:
+        if x["code"] not in have:
+            items.append(x)
     items.sort(key=lambda x: x["name"].lower())
-    for pref in ("en","tl"):
-        i = next((k for k,it in enumerate(items) if it["code"] == pref or it["code"].startswith(pref+"-")), None)
-        if i is not None: items.insert(0, items.pop(i))
-    items.insert(0, {"code":"auto","name":"Auto detect"})
+    PIN_TOP = ["en-PH","fil-PH","ceb-PH","ilo-PH","pam-PH","hil-PH","war-PH","en","tl"]
+    for pref in reversed(PIN_TOP):
+        i = next((k for k, it in enumerate(items) if it["code"] == pref), None)
+        if i is None and pref in ("en","tl"):
+            i = next((k for k, it in enumerate(items) if it["code"].startswith(pref + "-")), None)
+        if i is not None:
+            items.insert(0, items.pop(i))
+    items.insert(0, {"code": "auto", "name": "Auto detect"})
     return items
 
 def api_download_stream(CTX: dict, **params):
@@ -400,7 +471,6 @@ def api_say_play(CTX: dict, **params):
             t_play.start()
         def _arm_and_unpause():
             t0 = time.time()
-            # wait for IPC
             while time.time() - t0 < 3.0:
                 sock = _now.get("ipc")
                 if sock and os.path.exists(sock):
@@ -409,10 +479,8 @@ def api_say_play(CTX: dict, **params):
             sock = _now.get("ipc")
             if sock and os.path.exists(sock) and bad_indices:
                 threading.Thread(target=_run_beep_sync, args=(sock, float(dur or 0.0), toks, bad_indices, float(rate or 1.0)), daemon=True).start()
-            # unpause exactly once armed
             _mpv_ipc(["set_property","pause",False])
             _now["paused"] = False
-
         threading.Thread(target=_arm_and_unpause, daemon=True).start()
         def _start_sync_when_ready():
             t0 = time.time()
@@ -448,7 +516,6 @@ def api_play_file(CTX: dict, **params):
         _stop_player()
         _now.update({"file": fname, "lang": lang, "paused": True, "ipc": None})
         threading.Thread(target=_play_with_mpv, args=(str(fpath), rate, volume, pitch, True), daemon=True).start()
-
     def _arm_and_unpause():
         if not raw_text or not bad_indices:
             _mpv_ipc(["set_property","pause",False]); _now["paused"]=False; return
@@ -462,7 +529,6 @@ def api_play_file(CTX: dict, **params):
         if sock and os.path.exists(sock):
             threading.Thread(target=_run_beep_sync, args=(sock, float(dur or 0.0), toks, bad_indices, float(rate or 1.0)), daemon=True).start()
         _mpv_ipc(["set_property","pause",False]); _now["paused"]=False
-
     threading.Thread(target=_arm_and_unpause, daemon=True).start()
     def _start_sync_when_ready():
         if not toks or not bad_indices:
@@ -629,7 +695,7 @@ def _record_loop(selected_lang: str):
     _recording["used_lang"] = (lang_in_use if lang_in_use != "auto" else _DEFAULT_STT_LANG)
 
 def api_record_start(CTX: dict, **params):
-    lang = (params.get("lang") or "auto").strip()
+    lang = (params.get("input_lang") or params.get("lang") or "auto").strip()
     if _recording["running"]:
         return {"ok": False, "error": "already recording"}
     if lang.lower() != "auto":
@@ -652,4 +718,6 @@ def api_record_stop(CTX: dict, **params):
     used = _recording.get("used_lang") or (_recording["lang"] if _recording["lang"] != "auto" else _DEFAULT_STT_LANG)
     if _contains_bad(text):
         _buzz_api(ms=400)
-    return {"ok": True, "text": text, "lang": used}
+    dst = (params.get("translate_to") or "").strip()
+    translated = _translate_text(text, used, dst) if dst else text
+    return {"ok": True, "text": text, "lang": used, "translated": translated, "src": _lt_norm(used), "dst": _lt_norm(dst)}
