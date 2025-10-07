@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import importlib.util, pathlib, sys
+import importlib.util, pathlib, sys, os, requests
 
 HERE = pathlib.Path(__file__).resolve().parent
 TTS_FILE = HERE / "text-to-speech.py"
