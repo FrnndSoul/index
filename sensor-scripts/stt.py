@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import importlib.util, pathlib, sys, os, requests
+import importlib.util, pathlib, sys
 
 HERE = pathlib.Path(__file__).resolve().parent
 TTS_FILE = HERE / "text-to-speech.py"
-
-# in sensor-scripts/text-to-speech.py (top of file)
-LT_URL = os.environ.get("LT_URL") or "http://127.0.0.1:5005/translate"
 
 spec = importlib.util.spec_from_file_location("sensor_tts", TTS_FILE)
 if not spec or not spec.loader:
@@ -15,32 +12,8 @@ tts = importlib.util.module_from_spec(spec)
 sys.modules["sensor_tts"] = tts
 spec.loader.exec_module(tts)  # type: ignore[attr-defined]
 
-def _lt_base_url():
-    if not LT_URL:
-        return ""
-    u = LT_URL.strip()
-    return u[: -len("/translate")] if u.endswith("/translate") else u
-
 def api_langs(CTX: dict, **params):
-    langs = []
-    base = _lt_base_url()
-    if base:
-        try:
-            r = requests.get(f"{base}/languages", timeout=6)
-            r.raise_for_status()
-            for it in r.json():
-                code = (it.get("code") or "").lower()
-                name = it.get("name") or code
-                if code in ("fil", "tl"):      # normalize Tagalog/Filipino label
-                    code, name = "tl", "Filipino (tl)"
-                elif code.startswith("en"):
-                    code, name = "en", "English (en)"
-                langs.append({"code": code, "name": name})
-        except Exception:
-            langs = []
-
-    if not langs:  # fallback to the two local STT models you have
-        langs = [{"code": "tl", "name": "Filipino (tl)"},
+    langs = [{"code": "tl", "name": "Filipino (tl)"},
                  {"code": "en", "name": "English (en)"}]
 
     # unique & sorted
