@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import os, io, time, json, base64, tempfile, threading, subprocess, socket, datetime, queue, re
+import os, io, time, json, base64, tempfile, threading, subprocess, socket, datetime, queue, re, pathlib
 from pathlib import Path
 from typing import Any, Dict, Optional
 from functools import lru_cache
 from flask import send_file
 import requests
+import numpy as np
+
 
 try:
     from gtts import gTTS
@@ -18,19 +20,24 @@ try:
 except Exception:
     MP3 = None
 try:
-    from langdetect import detect as langdetect_detect
-except Exception:
-    def langdetect_detect(_): return "en"
-try:
     import sounddevice as sd
-    from vosk import Model, KaldiRecognizer
 except Exception:
     sd = None
+try:
+    from vosk import Model, KaldiRecognizer
+except Exception:
     Model = None
     KaldiRecognizer = None
+try:
+    from faster_whisper import WhisperModel
+except Exception:
+    WhisperModel = None
 
-# in sensor-scripts/text-to-speech.py (top of file)
 LT_URL = os.environ.get("LT_URL") or "http://127.0.0.1:5005/translate"
+USE_WHISPER = str(os.environ.get("USE_WHISPER", "")).lower() in ("1","true","yes","y")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "tiny")
+WHISPER_DEVICE = "cpu"
+WHISPER_COMPUTE = os.environ.get("WHISPER_COMPUTE", "int8")
 
 _BUZZER_PIN = 18
 _buzzer_kind = None
@@ -341,52 +348,62 @@ def _run_beep_sync(sock_path: str, mp3_duration_s: float, toks: list[str], bad_i
         time.sleep(0.02)
 
 def _lt_norm(code: str) -> str:
-    c = (code or "").lower()
-    if not c: return ""
-    c = c.replace("_","-")
-    if c.startswith("en"): return "en"
-    # was "fil"; must be "tl" for LibreTranslate
-    if c in ("tl","fil","fil-ph","tl-ph","tagalog"): return "tl"
-    return c.split("-")[0]
+    c = (code or "").strip().lower()
+    if not c:
+        return ""
+    c = c.replace("_", "-")
+    if c.startswith("en"):
+        return "en"
+    if c in ("fil", "fil-ph", "tl", "tl-ph", "tagalog"):
+        return "tl"
+    # map common variants to LT codes
+    aliases = {
+        "zh-hans": "zh", "zh-cn": "zh", "zh-hant": "zh",
+        "pt-br": "pt", "pt-pt": "pt",
+        "he": "he", "iw": "he",
+    }
+    base = c.split("-")[0]
+    return aliases.get(c, aliases.get(base, base))
 
-
-def _translate_text(text: str, src: str, dst: str) -> str:
+def _translate_text(text: str, src: str | None, dst: str | None) -> str:
     if not text or not LT_URL:
         return text
-    s, t = _lt_norm(src), _lt_norm(dst)
+    s = _lt_norm(src or "")
+    t = _lt_norm(dst or "")
     if not t or s == t:
         return text
-    try:
-        r = requests.post(LT_URL, json={"q": text, "source": s or "auto", "target": t, "format": "text"}, timeout=10)
-        r.raise_for_status()
-        j = r.json()
-        out = (j.get("translatedText") or j.get("translated_text") or text)
-        print(f"[translate] {s or 'auto'} -> {t}: {text!r} => {out!r}")
+
+    def _call_lt(q: str, source: str | None, target: str) -> str:
+        payload = {"q": q, "source": source or "auto", "target": target, "format": "text"}
+        try:
+            r = requests.post(LT_URL, json=payload, timeout=12)
+            r.raise_for_status()
+            j = r.json()
+            return j.get("translatedText") or j.get("translated_text") or q
+        except Exception:
+            return q
+
+    if s and s != "en" and t != "en":
+        mid = _call_lt(text, s, "en")
+        if not mid or mid == text:
+            mid = _call_lt(text, None, "en")
+        out = _call_lt(mid, "en", t)
         return out
-    except Exception as e:
-        print(f"[translate] error ({s}->{t}): {e}")
-        return text
+
+    return _call_lt(text, s or None, t)
 
 def api_out_langs(CTX: dict, **params):
-    if not LT_URL:
-        # Fallback minimal set if LT_URL isn't configured
-        return [{"code":"en","name":"English"},{"code":"fil","name":"Filipino"}]
     base = LT_URL.rstrip("/").rsplit("/", 1)[0] + "/languages"
     try:
-        r = requests.get(base, timeout=5)
+        r = requests.get(base, timeout=6)
         r.raise_for_status()
         items = r.json()
-        # items usually look like [{"code":"en","name":"English"}, ...]
-        # Normalize Tagalog/Filipino code to "fil" to match _lt_norm()
         out = []
         for it in items:
             code = (it.get("code") or "").lower()
             name = it.get("name") or code
-            if code in ("tl","tagalog"):
-                code = "fil"
-                name = "Filipino"
+            if code in ("tl","tagalog"): code, name = "fil", "Filipino"
             out.append({"code": code, "name": name})
-        # Pin common ones to the top
         pin = ["fil","en"]
         for p in reversed(pin):
             i = next((k for k, x in enumerate(out) if x["code"] == p), None)
@@ -394,7 +411,7 @@ def api_out_langs(CTX: dict, **params):
                 out.insert(0, out.pop(i))
         return out
     except Exception:
-        return [{"code":"en","name":"English"},{"code":"fil","name":"Filipino"}]
+        return [{"code":"fil","name":"Filipino"},{"code":"en","name":"English"}]
 
 def api_langs(CTX: dict, **params):
     include_providers = str(params.get("providers", "")).lower() in ("1","true","yes")
@@ -447,11 +464,14 @@ def api_say_play(CTX: dict, **params):
     pitch = _f(params.get("pitch", "1.0"), 0.5, 2.0, 1.0)
     volume= _f(params.get("volume","1.0"), 0.0, 1.0, 1.0)
     safe_text = _censor(raw_text)
-    if lang == "auto":
-        try: lang = langdetect_detect(safe_text)
-        except Exception: lang = "en"
-    lang = _canon_lang(lang)
     try:
+        if lang == "auto":
+            try:
+                from langdetect import detect as langdetect_detect
+                lang = langdetect_detect(safe_text)
+            except Exception:
+                lang = "en"
+        lang = _canon_lang(lang)
         tts = gTTS(text=safe_text, lang=lang)
         buf = io.BytesIO()
         tts.write_to_fp(buf)
@@ -628,7 +648,7 @@ def _make_recognizer(lang_code: str, samplerate: int = 16000):
     rec.SetWords(True)
     return rec
 
-_recording = {"thread": None, "running": False, "lang": "auto", "text": "", "used_lang": None}
+_recording = {"thread": None, "running": False, "lang": "auto", "text": "", "used_lang": None, "pcm": bytearray()}
 
 def _score_text(s: str) -> int:
     return len([t for t in s.split() if t])
@@ -644,7 +664,49 @@ def _choose_lang_by_probe(buf: bytes, samplerate: int = 16000) -> str:
             best_score, best_lang = score, cand
     return best_lang
 
-def _record_loop(selected_lang: str):
+def _wh_lang_norm(code: str) -> str | None:
+    c = (code or "").strip().lower()
+    if not c or c == "auto":
+        return None
+    c = c.replace("_","-")
+    m = {
+        "fil":"tl", "tagalog":"tl", "tl":"tl",
+        "en":"en", "en-ph":"en", "en-us":"en", "en-gb":"en",
+        "zh":"zh", "zh-cn":"zh", "zh-hans":"zh", "zh-hant":"zh", "zh-tw":"zh",
+        "pt-br":"pt", "pt-pt":"pt",
+        "he":"he", "iw":"he",
+    }
+    base = c.split("-")[0]
+    return m.get(c, m.get(base, base))
+
+_wh_model = None
+def _get_whisper():
+    global _wh_model
+    if _wh_model is None:
+        if WhisperModel is None:
+            raise RuntimeError("whisper not installed")
+        _wh_model = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE)
+    return _wh_model
+
+def _record_loop_whisper(selected_lang: str):
+    if sd is None:
+        _recording.update({"running": False})
+        return
+    samplerate, blocksize = 16000, 4000
+    q: "queue.Queue[bytes]" = queue.Queue()
+    def cb(indata, frames, time_info, status):
+        if _recording["running"]:
+            q.put(bytes(indata))
+    _recording.update({"pcm": bytearray(), "text": "", "used_lang": None, "running": True})
+    with sd.RawInputStream(samplerate=samplerate, blocksize=blocksize, dtype='int16', channels=1, callback=cb):
+        while _recording["running"]:
+            try:
+                chunk = q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            _recording["pcm"].extend(chunk)
+
+def _record_loop_vosk(selected_lang: str):
     if sd is None or KaldiRecognizer is None:
         _recording.update({"running": False})
         return
@@ -695,29 +757,75 @@ def _record_loop(selected_lang: str):
     _recording["used_lang"] = (lang_in_use if lang_in_use != "auto" else _DEFAULT_STT_LANG)
 
 def api_record_start(CTX: dict, **params):
-    lang = (params.get("input_lang") or params.get("lang") or "auto").strip()
+    lang = (params.get("input_lang") or params.get("lang") or "auto").strip().lower()
     if _recording["running"]:
         return {"ok": False, "error": "already recording"}
-    if lang.lower() != "auto":
+    _recording["lang"] = lang or "auto"
+    if not USE_WHISPER and lang.lower() != "auto":
         try: _ = _load_model(lang)
         except Exception as e:
             return {"ok": False, "error": f"STT model not available for '{lang}': {e}"}
-    _recording["lang"] = lang
-    t = threading.Thread(target=_record_loop, args=(lang,), daemon=True)
+    t = threading.Thread(
+        target=_record_loop_whisper if USE_WHISPER else _record_loop_vosk,
+        args=(lang,),
+        daemon=True
+    )
     _recording["thread"] = t
+    _recording["running"] = True
     t.start()
     return {"ok": True, "status": "recording"}
 
+def _pcm16_to_float32(pcm_bytes: bytes) -> "np.ndarray":
+    if not pcm_bytes:
+        return np.zeros(0, dtype=np.float32)
+    a = np.frombuffer(pcm_bytes, dtype=np.int16)
+    return (a.astype(np.float32) / 32768.0)
+
+def _whisper_transcribe(pcm_bytes: bytes, lang_pref: str | None) -> tuple[str, str]:
+    audio = _pcm16_to_float32(pcm_bytes)
+    if audio.size == 0:
+        return "", (lang_pref or "auto") or ""
+    model = _get_whisper()
+    forced = _wh_lang_norm(lang_pref or "")
+    def run(lang_code):
+        segments, info = model.transcribe(
+            audio,
+            language=lang_code,
+            task="transcribe",
+            vad_filter=True,
+            beam_size=1,
+            without_timestamps=True
+        )
+        text = "".join(seg.text for seg in segments).strip()
+        used_lang = (info.language or (lang_code or "auto") or "").lower()
+        return text, used_lang
+    text, used = run(forced)
+    if not text and forced is not None:
+        text, used = run(None)
+    used = _lt_norm(used or "")
+    return text, used or "auto"
+
 def api_record_stop(CTX: dict, **params):
     if not _recording["running"]:
-        return {"ok": False, "error": "not recording"}
+        pass
     _recording["running"] = False
-    t = _recording["thread"]
-    if t: t.join(timeout=3.0)
-    text = (_recording["text"] or "").strip()
-    used = _recording.get("used_lang") or (_recording["lang"] if _recording["lang"] != "auto" else _DEFAULT_STT_LANG)
+    t = _recording.get("thread")
+    if t: t.join(timeout=6.0)
+    if USE_WHISPER:
+        pcm = bytes(_recording.get("pcm") or b"")
+        pref = _recording.get("lang") or "auto"
+        text, used = _whisper_transcribe(pcm, pref)
+        _recording["text"] = text
+        _recording["used_lang"] = used or (pref if pref != "auto" else "en")
+    else:
+        if not _recording.get("used_lang"):
+            _recording["used_lang"] = _DEFAULT_STT_LANG
+    text = (_recording.get("text") or "").strip()
+    used = _recording.get("used_lang") or "en"
     if _contains_bad(text):
         _buzz_api(ms=400)
     dst = (params.get("translate_to") or "").strip()
     translated = _translate_text(text, used, dst) if dst else text
-    return {"ok": True, "text": text, "lang": used, "translated": translated, "src": _lt_norm(used), "dst": _lt_norm(dst)}
+    if translated is None:
+        translated = ""
+    return {"ok": True, "text": text, "translated": translated, "lang": used, "src": _lt_norm(used), "dst": _lt_norm(dst)}
