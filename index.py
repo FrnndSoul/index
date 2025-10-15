@@ -232,10 +232,25 @@ def face_stream():
 def face_overlay():
     return dispatch("face", "overlay")
 
-
 @app.get("/api/cam/health")
 def cam_health():
     return dispatch("cam", "health")
+
+@app.post("/api/face/enroll/start")
+def face_enroll_start():
+    return dispatch("face", "enroll_start")
+
+@app.get("/api/face/enroll/check")
+def face_enroll_check():
+    return dispatch("face", "enroll_check")
+
+@app.post("/api/face/enroll/capture")
+def face_enroll_capture():
+    return dispatch("face", "enroll_capture")
+
+@app.post("/api/face/enroll/commit")
+def face_enroll_commit():
+    return dispatch("face", "enroll_commit")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
