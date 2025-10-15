@@ -50,6 +50,7 @@ ALIASES = {
     "tts":        "text-to-speech.py",
     "stt":        "stt.py",
     "cam":        "camera.py",
+    "face":       "face.py",
 }
 
 # ---------- Lazy module loader with cache ----------
@@ -209,6 +210,28 @@ def cam_stream():
     if isinstance(resp, Response):
         return resp
     return jsonify(resp)
+
+# ---------- Face (uses the same dispatcher pattern) ----------
+@app.get("/api/face/status")
+def face_status():
+    return dispatch("face", "status")
+
+@app.post("/api/face/toggle")
+def face_toggle():
+    return dispatch("face", "toggle")
+
+@app.get("/api/face")
+def face_stream():
+    m = _load(ALIASES["face"])
+    resp = m.api_mjpg(CTX, quality=65, fps=30)
+    if isinstance(resp, Response):
+        return resp
+    return jsonify(resp)
+  
+@app.post("/api/face/overlay")
+def face_overlay():
+    return dispatch("face", "overlay")
+
 
 @app.get("/api/cam/health")
 def cam_health():
