@@ -16,22 +16,24 @@ def _p(*parts): return str(pathlib.Path(*parts))
 CTX = {
     "paths": {
         "resources_dir": _p(R_DIR),
+        "models_dir":    _p(R_DIR, "models"),
         "dht_db":        _p(R_DIR, "dht_readings.db"),
-        "gv_db":         _p(R_DIR, "gv_data.db"),      # <- gas/vibration DB
+        "gv_db":         _p(R_DIR, "gv_data.db"),
     },
     "pins": {
-        "dht": {"pin": int(os.environ.get("DHT_PIN", 4)),
-                "kind": os.environ.get("DHT_KIND", "DHT11")},
+        "dht":    {"pin": int(os.environ.get("DHT_PIN", 4)), "kind": os.environ.get("DHT_KIND", "DHT11")},
         "buzzer": {"pin": int(os.environ.get("BUZZER_PIN", 18))},
         "ultra": {
-            "A": {"trig": int(os.environ.get("ULTRA_A_TRIG", 23)),
-                  "echo": int(os.environ.get("ULTRA_A_ECHO", 24))},
-            "B": {"trig": int(os.environ.get("ULTRA_B_TRIG", 5)),
-                  "echo": int(os.environ.get("ULTRA_B_ECHO", 6))}
+            "A": {"trig": int(os.environ.get("ULTRA_A_TRIG", 23)), "echo": int(os.environ.get("ULTRA_A_ECHO", 24))},
+            "B": {"trig": int(os.environ.get("ULTRA_B_TRIG", 5)),  "echo": int(os.environ.get("ULTRA_B_ECHO", 6))}
         },
         "pir": {"pin": int(os.environ.get("PIR_PIN", 22))}
     },
-    "state": { "ultra": {"A": None, "B": None} }
+    "state": {
+        "ultra": {"A": None, "B": None},
+        # vision state is maintained inside sensor-scripts/vision.py, but we keep a slot here
+        "vision": {"enabled": True, "allow": [], "fps": 0.0, "faces": 0, "objects": 0},
+    },
 }
 
 # ---------- Module aliases ----------
@@ -49,8 +51,13 @@ ALIASES = {
     "acc":        "accelerometer.py",
     "tts":        "text-to-speech.py",
     "stt":        "stt.py",
+    # keep for compatibility; camera.py may still provide health
     "cam":        "camera.py",
+    # optional modules:
     "face":       "face.py",
+    "objdetect":  "objdetect.py",
+    # unified pipeline:
+    "vision":     "vision.py",
 }
 
 # ---------- Lazy module loader with cache ----------
@@ -79,7 +86,7 @@ CORS(app)
 
 @app.get("/api/health")
 def health():
-    return jsonify({"ok": True, "time": int(time.time()*1000), "ctx": CTX})
+    return jsonify({"ok": True, "time": int(time.time()*1000), "ctx": {"paths": CTX["paths"]}})
 
 # ---------- Generic dispatcher: /api/<sensor>/<op> ----------
 @app.route("/api/<sensor>/<op>", methods=["GET", "POST", "DELETE"])
@@ -90,167 +97,162 @@ def dispatch(sensor: str, op: str):
     if func is None:
         return jsonify({"ok": False, "error": f"{fname} missing api_{op}"}), 404
 
-    # Parse params for each method
-    if request.method in ("GET", "DELETE"):
-        params = request.args.to_dict()
-    else:  # POST (and future JSON methods)
-        params = request.get_json(silent=True) or {}
-
+    params = request.args.to_dict() if request.method in ("GET", "DELETE") else (request.get_json(silent=True) or {})
     try:
         return jsonify(func(CTX, **params))
     except TypeError:
-        # Back-compat for handlers that expect a single dict
         return jsonify(func(CTX, params))
 
+# ---------- PIR camera passthrough ----------
 @app.get("/api/pir/status")
 def pir_status():  return dispatch("pir", "status")
-
 @app.get("/api/pir")
 def pir_value():   return dispatch("pir", "pir")
-
 @app.get("/api/pir/config")
 def pir_cfg_get(): return dispatch("pir", "config")
-
 @app.post("/api/pir/config")
 def pir_cfg_set(): return dispatch("pir", "config_set")
-
 @app.get("/api/pir/cam")
 def pir_cam():
     m = _load(ALIASES["pir"])
     q = request.args.to_dict()
     resp = m.api_cam(CTX, **q)
-    if isinstance(resp, Response):
-        return resp
-    return jsonify(resp)
+    return resp if isinstance(resp, Response) else jsonify(resp)
 
+# ---------- Ultrasonic ----------
 @app.get("/api/ultra")
-def ultra_a():
-    return jsonify(_load(ALIASES["ultra"]).api_read(CTX, id="A"))
-
+def ultra_a(): return jsonify(_load(ALIASES["ultra"]).api_read(CTX, id="A"))
 @app.get("/api/sonic")
-def ultra_b():
-    return jsonify(_load(ALIASES["sonic"]).api_read(CTX, id="B"))
+def ultra_b(): return jsonify(_load(ALIASES["sonic"]).api_read(CTX, id="B"))
 
+# ---------- DHT ----------
 @app.get("/api/dht")
 def dht_latest():  return dispatch("dht", "latest")
-
 @app.get("/api/dht/read")
 def dht_read():    return dispatch("dht", "read")
-
 @app.get("/api/dht/history")
 def dht_hist():    return dispatch("dht", "history")
 
+# ---------- Buzzer ----------
 @app.route("/api/buzzer/beep", methods=["GET","POST"])
 def buzz_beep():   return dispatch("buzzer", "beep")
 
+# ---------- Gas & Vibration ----------
 @app.get("/api/gas")
-def gas_read_short():
-    return dispatch("gas", "read")
-
+def gas_read_short():           return dispatch("gas", "read")
 @app.get("/api/vibrate")
-def vibrate_read_short():
-    return dispatch("vibration", "read")
-
+def vibrate_read_short():       return dispatch("vibration", "read")
 @app.get("/api/gas/latest")
-def gas_latest_short():
-    return dispatch("gas", "latest")
-
+def gas_latest_short():         return dispatch("gas", "latest")
 @app.get("/api/vibration/latest")
-def vibration_latest_short():
-    return dispatch("vibration", "latest")
-
+def vibration_latest_short():   return dispatch("vibration", "latest")
 @app.get("/api/gas/history")
-def gas_history_short():
-    return dispatch("gas", "history")
-
+def gas_history_short():        return dispatch("gas", "history")
 @app.get("/api/vibration/history")
-def vibration_history_short():
-    return dispatch("vibration", "history")
-  
+def vibration_history_short():  return dispatch("vibration", "history")
+
+# ---------- Other sensors ----------
 @app.get("/api/sound")
 def sound_short(): return dispatch("sound", "read")
-
 @app.get("/api/rain")
 def rain_short():  return dispatch("rain", "read")
-
 @app.get("/api/gps")
-def gps_read_short():
-    return dispatch("gps", "read")
-
+def gps_read_short(): return dispatch("gps", "read")
 @app.get("/api/acc")
-def acc_read_short():
-    return dispatch("acc", "read")
-  
-@app.get("/api/tts")
-def tts_health():
-    return dispatch("tts", "status")
+def acc_read_short(): return dispatch("acc", "read")
 
+# ---------- TTS ----------
+@app.get("/api/tts")
+def tts_health(): return dispatch("tts", "status")
 @app.get("/api/tts/download")
 def tts_download():
     m = _load(ALIASES["tts"])
     q = request.args.to_dict()
     resp = m.api_download_stream(CTX, **q)
-    # If module returned a Flask Response, pass it through as-is.
-    if isinstance(resp, Response):
-        return resp
-    # Otherwise, it returned an error dict — jsonify that.
-    return jsonify(resp)
-
+    return resp if isinstance(resp, Response) else jsonify(resp)
 @app.delete("/api/tts/delete")
 def tts_delete():
     m = _load(ALIASES["tts"])
     q = request.args.to_dict()
     return jsonify(m.api_delete(CTX, **q))
-  
+
+# ---------- Unified vision (authoritative) ----------
+# Camera stream MUST be the vision pipeline so overlay/toggle/FPS work.
 @app.get("/api/cam")
 def cam_stream():
-    m = _load(ALIASES["cam"])
+    m = _load("vision.py")  # force unified pipeline
     q = request.args.to_dict()
-    resp = m.api_cam(CTX, **q)
-    if isinstance(resp, Response):
-        return resp
-    return jsonify(resp)
+    resp = m.api_mjpg(CTX, **q)
+    return resp if isinstance(resp, Response) else jsonify(resp)
 
-# ---------- Face (uses the same dispatcher pattern) ----------
+# Snapshot also via vision (keeps one overlay code path)
+@app.get("/api/cam.jpg")
+def cam_snapshot():
+    m = _load("vision.py")
+    q = request.args.to_dict()
+    resp = m.api_jpg(CTX, **q)
+    return resp if isinstance(resp, Response) else jsonify(resp)
+
+# (Optional) if your old camera.py exposes health, keep this:
+@app.get("/api/cam/health")
+def cam_health():
+    try:
+        return dispatch("cam", "health")
+    except Exception:
+        return jsonify({"ok": True})
+
+# Vision control/status used by the frontend
+@app.get("/api/vision/status")
+def vision_status():
+    m = _load("vision.py")
+    return jsonify(m.api_status(CTX))
+
+@app.post("/api/vision/overlay")
+def vision_overlay():
+    m = _load("vision.py")
+    payload = request.get_json(silent=True) or {}
+    payload |= request.args.to_dict()  # allow ?enabled=1
+    return jsonify(m.api_overlay(CTX, **payload))
+
+@app.get("/api/vision/labels")
+def vision_labels():  return dispatch("vision","labels")
+
+@app.post("/api/vision/allow")
+def vision_allow():   return dispatch("vision","allow")
+
+# ---------- (Optional) legacy face/obj streams ----------
 @app.get("/api/face/status")
 def face_status():
     return dispatch("face", "status")
 
-@app.post("/api/face/toggle")
-def face_toggle():
-    return dispatch("face", "toggle")
+@app.post("/api/face/overlay")
+def face_overlay():
+    return dispatch("face", "overlay")
 
 @app.get("/api/face")
 def face_stream():
     m = _load(ALIASES["face"])
     resp = m.api_mjpg(CTX, quality=65, fps=30)
-    if isinstance(resp, Response):
-        return resp
-    return jsonify(resp)
-  
-@app.post("/api/face/overlay")
-def face_overlay():
-    return dispatch("face", "overlay")
+    return resp if isinstance(resp, Response) else jsonify(resp)
 
-@app.get("/api/cam/health")
-def cam_health():
-    return dispatch("cam", "health")
+@app.get("/api/objdetect/status")
+def objdetect_status():
+    return dispatch("objdetect", "status")
 
-@app.post("/api/face/enroll/start")
-def face_enroll_start():
-    return dispatch("face", "enroll_start")
+@app.post("/api/objdetect/overlay")
+def objdetect_overlay():
+    return dispatch("objdetect", "overlay")
 
-@app.get("/api/face/enroll/check")
-def face_enroll_check():
-    return dispatch("face", "enroll_check")
+@app.get("/api/objdetect/labels")
+def objdetect_labels():
+    return dispatch("objdetect", "labels")
 
-@app.post("/api/face/enroll/capture")
-def face_enroll_capture():
-    return dispatch("face", "enroll_capture")
+@app.get("/api/objdetect")
+def objdetect_stream():
+    m = _load(ALIASES["objdetect"])
+    resp = m.api_mjpg(CTX, quality=65, fps=30)
+    return resp if isinstance(resp, Response) else jsonify(resp)
 
-@app.post("/api/face/enroll/commit")
-def face_enroll_commit():
-    return dispatch("face", "enroll_commit")
-
+# ---------- Main ----------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
