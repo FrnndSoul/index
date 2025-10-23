@@ -539,3 +539,22 @@ def api_face_enroll_commit(ctx: dict, name: str | None = None, **_):
     (DB_DIR / f"{pid}.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     np.save(DB_DIR / f"{pid}.npy", emb)
     return {"ok": True, "id": pid}
+  
+def api_release(ctx: dict, **_) -> Dict[str, object]:
+    global _cap
+    released = False
+    with _cap_lock:
+        if _cap is not None:
+            try:
+                _cap.release()
+            except Exception:
+                pass
+            _cap = None
+            released = True
+    # also clear last detections to be tidy
+    with RT.lock:
+        RT.last_objects = []
+        RT.faces = 0
+        RT.objects = 0
+    return {"ok": True, "released": released}
+

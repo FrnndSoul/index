@@ -227,6 +227,11 @@ def vision_labels():  return dispatch("vision","labels")
 @app.post("/api/vision/allow")
 def vision_allow():   return dispatch("vision","allow")
 
+@app.post("/api/vision/release")
+def vision_release():
+    m = _load("vision.py")
+    return jsonify(m.api_release(CTX))
+
 # ---------- Legacy face/obj streams (optional) ----------
 @app.get("/api/face/status")
 def face_status():
