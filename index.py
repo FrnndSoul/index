@@ -21,16 +21,12 @@ CTX = {
         "gv_db":         _p(R_DIR, "gv_data.db"),
     },
     "pins": {
-        # DHT defaults: BCM4 / DHT11 (override with env if needed)
         "dht":    {"pin": int(os.environ.get("DHT_PIN", 4)), "kind": os.environ.get("DHT_KIND", "DHT11")},
-        # Buzzer
         "buzzer": {"pin": int(os.environ.get("BUZZER_PIN", 18))},
-        # Ultrasonic A/B
         "ultra": {
             "A": {"trig": int(os.environ.get("ULTRA_A_TRIG", 23)), "echo": int(os.environ.get("ULTRA_A_ECHO", 24))},
             "B": {"trig": int(os.environ.get("ULTRA_B_TRIG", 5)),  "echo": int(os.environ.get("ULTRA_B_ECHO", 6))}
         },
-        # PIR
         "pir": {"pin": int(os.environ.get("PIR_PIN", 22))}
     },
     "state": {
@@ -57,7 +53,6 @@ ALIASES = {
     "face":       "face.py",
     "objdetect":  "objdetect.py",
     "vision":     "vision.py",
-    # NEW: LEDs + server-side voice
     "leds":       "leds.py",
     "voice":      "voice.py",
 }
@@ -103,7 +98,6 @@ def dispatch(sensor: str, op: str):
     try:
         return jsonify(func(CTX, **params))
     except TypeError:
-        # backward-compat single dict signature
         return jsonify(func(CTX, params))
 
 # ---------- PIR camera passthrough ----------
@@ -182,7 +176,7 @@ def tts_delete():
 # ---------- Unified vision (authoritative) ----------
 @app.get("/api/cam")
 def cam_stream():
-    m = _load("vision.py")  # unified pipeline
+    m = _load("vision.py")
     q = request.args.to_dict()
     resp = m.api_mjpg(CTX, **q)
     return resp if isinstance(resp, Response) else jsonify(resp)
@@ -201,7 +195,7 @@ def cam_health():
     except Exception:
         return jsonify({"ok": True})
 
-# Vision control/status
+# ---- Vision control/status
 @app.get("/api/vision/status")
 def vision_status():
     m = _load("vision.py")
@@ -213,6 +207,19 @@ def vision_overlay():
     payload = request.get_json(silent=True) or {}
     payload |= request.args.to_dict()
     return jsonify(m.api_overlay(CTX, **payload))
+
+# NEW: set which detectors run (faces/objects) and overlay on/off
+@app.post("/api/vision/mode")
+def vision_mode():
+    m = _load("vision.py")
+    payload = request.get_json(silent=True) or {}
+    payload |= request.args.to_dict()
+    return jsonify(m.api_mode(CTX, **payload))
+
+# NEW: fetch latest detections
+@app.get("/api/vision/detections")
+def vision_detections():
+    return dispatch("vision", "detections")
 
 @app.get("/api/vision/labels")
 def vision_labels():  return dispatch("vision","labels")
@@ -253,7 +260,7 @@ def objdetect_stream():
     resp = m.api_mjpg(CTX, quality=65, fps=30)
     return resp if isinstance(resp, Response) else jsonify(resp)
 
-# ---- Face enrollment routed to vision (REQUIRED) ----
+# ---- Face enrollment routed to vision ----
 @app.post("/api/face/enroll_start")
 def enroll_start():
     m = _load("vision.py")
@@ -273,11 +280,10 @@ def face_enroll_capture():
 def face_enroll_commit():
     return jsonify(_load("vision.py").api_face_enroll_commit(CTX, **(request.get_json(silent=True) or {})))
 
-# ====== NEW: System status (LED + latest DHT, normalized for frontend) ======
+# ====== System / LEDs / Voice ======
 @app.get("/api/status")
 def api_status():
     leds = _load("leds.py").api_status(CTX)["leds"]
-    # DHT latest (normalize to keys temp_c/hum/ts(ms))
     try:
         dht = _load("temp-humidity.py").api_latest(CTX)
         dht_norm = {
@@ -289,14 +295,12 @@ def api_status():
         dht_norm = None
     return jsonify({"leds": leds, "dht": dht_norm})
 
-# ====== NEW: LED control endpoint used by frontend ======
 @app.post("/api/leds")
 def api_leds():
     m = _load("leds.py")
     payload = request.get_json(silent=True) or {}
     return jsonify(m.api_set(CTX, **payload))
 
-# ====== NEW: Server-side voice control ======
 @app.get("/api/voice/status")
 def voice_status():
     return jsonify(_load("voice.py").api_status(CTX))

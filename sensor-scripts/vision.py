@@ -4,6 +4,7 @@ import json, time, threading, pathlib, uuid
 from typing import Dict, Tuple, Optional, List
 import cv2, numpy as np
 from flask import Response
+
 try:
     from tflite_runtime.interpreter import Interpreter
 except Exception:
@@ -19,6 +20,7 @@ for p in (MODEL_DIR, DB_DIR):
 OBJ_MODEL = MODEL_DIR / "detect.tflite"
 LBL_PATH = MODEL_DIR / "labelmap.txt"
 
+# -------------------- Camera --------------------
 _cap: Optional[cv2.VideoCapture] = None
 _cap_lock = threading.Lock()
 
@@ -65,6 +67,7 @@ def _read_frame() -> Optional[np.ndarray]:
             return None
     return frame
 
+# -------------------- Model helpers --------------------
 def _norm(s: str) -> str:
     return "".join(ch for ch in s.lower() if ch.isalnum())
 
@@ -121,32 +124,32 @@ def _nms(dets, iou_thr=OBJ_NMS_IOU):
         dets = [d for d in dets if iou(m, d) < iou_thr]
     return keep
 
+# -------------------- Runtime --------------------
 class Runtime:
     def __init__(self):
         self.lock = threading.Lock()
-        self.overlay_enabled = True
+        self.overlay_enabled = False           # draw boxes?
+        self.detect_faces = False              # toggle face detector
+        self.detect_objects = True             # toggle object detector
         self.allow: List[str] = []
         self.allow_norm: set[str] = set()
+
         self.fps = 0.0
         self.faces = 0
         self.objects = 0
+
         self.cascade: Optional[cv2.CascadeClassifier] = None
         self.obj_rt = None
         self.obj_lock = threading.Lock()
         self.profiles: List[Dict] = []
+
         self._fps_count = 0
         self._t0 = time.time()
-    @staticmethod
-    def _embed_from_crop(img: np.ndarray) -> np.ndarray:
-        g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        g = cv2.equalizeHist(g)
-        f = cv2.resize(g, (32, 32), interpolation=cv2.INTER_AREA).astype("float32").reshape(-1)
-        f = (f - f.mean()) / (f.std() + 1e-6)
-        n = np.linalg.norm(f) + 1e-6
-        return f / n
-    @staticmethod
-    def _cos(a: np.ndarray, b: np.ndarray) -> float:
-        return float(np.dot(a, b) / ((np.linalg.norm(a) + 1e-6) * (np.linalg.norm(b) + 1e-6)))
+
+        # last detections (for /api/vision/detections)
+        self.last_objects: List[Dict] = []
+        self.last_faces: int = 0
+
     def _load_profiles(self):
         profs = []
         for j in DB_DIR.glob("*.json"):
@@ -158,6 +161,7 @@ class Runtime:
             except Exception:
                 pass
         self.profiles = profs
+
     def ensure_models(self):
         if self.cascade is None:
             self.cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
@@ -165,6 +169,7 @@ class Runtime:
             self.obj_rt = _load_ssd(OBJ_MODEL)
         if not self.profiles:
             self._load_profiles()
+
     def infer_objects(self, frame_bgr: np.ndarray):
         if self.obj_rt is None:
             return []
@@ -205,35 +210,47 @@ class Runtime:
                 continue
             raw.append((x, y, w, h, cid, sc, name))
         return _nms(raw)
+
     def recognize(self, frame_bgr: np.ndarray, boxes: List[Tuple[int,int,int,int]]):
         if not self.profiles:
             return []
+        # simple cosine against enrolled profiles
         out = []
         for (x, y, w, h) in boxes:
             crop = frame_bgr[max(0, y):y + h, max(0, x):x + w]
             if crop.size == 0:
                 continue
-            vec = self._embed_from_crop(crop)
+            g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            g = cv2.equalizeHist(g)
+            f = cv2.resize(g, (32, 32), interpolation=cv2.INTER_AREA).astype("float32").reshape(-1)
+            f = (f - f.mean()) / (f.std() + 1e-6)
+            f /= (np.linalg.norm(f) + 1e-6)
             best, name = 0.0, "unknown"
             for p in self.profiles:
-                sc = self._cos(vec, p["_vec"])
+                pv = p["_vec"]
+                if pv.shape != f.shape:
+                    continue
+                sc = float(np.dot(f, pv) / ((np.linalg.norm(f) + 1e-6) * (np.linalg.norm(pv) + 1e-6)))
                 if sc > best:
-                    best = sc
-                    name = p.get("name", "unknown")
+                    best, name = sc, p.get("name", "unknown")
             out.append(((x, y, w, h), name, max(0.0, min(1.0, best))))
         return out
+
     def _draw(self, frame_bgr, faces, names, objs):
         if not self.overlay_enabled:
             return
-        for (x, y, w, h) in faces:
-            cv2.rectangle(frame_bgr, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        for ((x, y, w, h), name, sc) in names:
-            lbl = f"{name} {int(sc*100)}%"
-            cv2.putText(frame_bgr, lbl, (x, max(0, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 220, 255), 2, cv2.LINE_AA)
-        for (x, y, w, h, cid, sc, name) in objs:
-            cv2.rectangle(frame_bgr, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            lbl = f"{name} {int(sc*100)}%"
-            cv2.putText(frame_bgr, lbl, (x, max(0, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 220, 255), 2, cv2.LINE_AA)
+        if self.detect_faces:
+            for (x, y, w, h) in faces:
+                cv2.rectangle(frame_bgr, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            for ((x, y, w, h), name, sc) in names:
+                lbl = f"{name} {int(sc*100)}%"
+                cv2.putText(frame_bgr, lbl, (x, max(0, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 220, 255), 2, cv2.LINE_AA)
+        if self.detect_objects:
+            for (x, y, w, h, cid, sc, name) in objs:
+                cv2.rectangle(frame_bgr, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                lbl = f"{name} {int(sc*100)}%"
+                cv2.putText(frame_bgr, lbl, (x, max(0, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 220, 255), 2, cv2.LINE_AA)
+
     def _tick_fps(self):
         self._fps_count += 1
         dtt = time.time() - self._t0
@@ -245,6 +262,7 @@ class Runtime:
 RT = Runtime()
 PROFILE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
 
+# -------------------- APIs --------------------
 def api_status(ctx: dict, **_) -> Dict[str, object]:
     with RT.lock:
         return {
@@ -253,6 +271,8 @@ def api_status(ctx: dict, **_) -> Dict[str, object]:
             "faces": RT.faces,
             "objects": RT.objects,
             "overlay": RT.overlay_enabled,
+            "detect_faces": RT.detect_faces,
+            "detect_objects": RT.detect_objects,
             "allow": list(RT.allow),
             "vision": {"enabled": RT.overlay_enabled, "allow": list(RT.allow)},
         }
@@ -265,6 +285,24 @@ def api_overlay(ctx: dict, enabled: bool | str | None = None, **_) -> Dict[str, 
     with RT.lock:
         RT.overlay_enabled = bool(enabled)
     return {"ok": True, "overlay": RT.overlay_enabled}
+
+def api_mode(ctx: dict,
+             detect_faces: bool | str | None = None,
+             detect_objects: bool | str | None = None,
+             overlay: bool | str | None = None,
+             **_) -> Dict[str, object]:
+    def _coerce(x):
+        if isinstance(x, str):
+            return x.lower() in ("1","true","yes","on")
+        return x if isinstance(x, bool) else None
+    df = _coerce(detect_faces)
+    do = _coerce(detect_objects)
+    ov = _coerce(overlay)
+    with RT.lock:
+        if df is not None: RT.detect_faces = df
+        if do is not None: RT.detect_objects = do
+        if ov is not None: RT.overlay_enabled = ov
+        return {"ok": True, "detect_faces": RT.detect_faces, "detect_objects": RT.detect_objects, "overlay": RT.overlay_enabled}
 
 def api_labels(ctx: dict, **_) -> Dict[str, object]:
     return {"ok": True, "labels": OBJ_LABELS}
@@ -286,6 +324,11 @@ def api_allow(ctx: dict, allow: List[str] | None = None, **_) -> Dict[str, objec
         RT.allow_norm = normed
     return {"ok": True, "allow": list(RT.allow)}
 
+def api_detections(ctx: dict, **_) -> Dict[str, object]:
+    with RT.lock:
+        return {"ok": True, "objects": list(RT.last_objects), "faces": int(RT.last_faces)}
+
+# -------------------- Streaming --------------------
 def api_mjpg(ctx: dict, quality: int | str = 65, fps: float | str = 30.0, **_) -> Response:
     q = max(1, min(95, int(float(quality)))) if isinstance(quality, (int, float, str)) else 65
     fps_limit = float(fps) if fps not in (None, "", "0") else 0.0
@@ -293,6 +336,7 @@ def api_mjpg(ctx: dict, quality: int | str = 65, fps: float | str = 30.0, **_) -
     enc = [int(cv2.IMWRITE_JPEG_QUALITY), int(q)]
     boundary = b"--cam_boundary"
     RT.ensure_models()
+
     def gen():
         last_tick = 0.0
         face_boxes: List[Tuple[int,int,int,int]] = []
@@ -306,21 +350,41 @@ def api_mjpg(ctx: dict, quality: int | str = 65, fps: float | str = 30.0, **_) -
                 if dt < min_dt:
                     time.sleep(min_dt - dt)
                 last_tick = time.time()
+
             frame = _read_frame()
             if frame is None:
                 time.sleep(0.02)
                 continue
+
             if (i % 3) == 0:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                small = cv2.resize(gray, (0, 0), fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-                boxes_small = RT.cascade.detectMultiScale(small, scaleFactor=1.15, minNeighbors=4, minSize=(24, 24))
-                face_boxes = [(int(x/0.5), int(y/0.5), int(w/0.5), int(h/0.5)) for (x, y, w, h) in boxes_small]
-                RT.faces = len(face_boxes)
-                name_tags = RT.recognize(frame, face_boxes)
+                if RT.detect_faces:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    small = cv2.resize(gray, (0, 0), fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+                    boxes_small = RT.cascade.detectMultiScale(small, scaleFactor=1.15, minNeighbors=4, minSize=(24, 24))
+                    face_boxes = [(int(x/0.5), int(y/0.5), int(w/0.5), int(h/0.5)) for (x, y, w, h) in boxes_small]
+                    RT.faces = len(face_boxes)
+                    name_tags = RT.recognize(frame, face_boxes)
+                else:
+                    face_boxes = []
+                    name_tags = []
+                    RT.faces = 0
+
             if (i % 3) == 0:
-                objs = RT.infer_objects(frame)
-                RT.objects = len(objs)
+                if RT.detect_objects:
+                    objs = RT.infer_objects(frame)
+                    RT.objects = len(objs)
+                    with RT.lock:
+                        RT.last_objects = [
+                            {"label": name, "score": float(sc), "box": [int(x), int(y), int(w), int(h)]}
+                            for (x, y, w, h, cid, sc, name) in objs
+                        ]
+                else:
+                    objs = []
+                    RT.objects = 0
+                    with RT.lock:
+                        RT.last_objects = []
             i += 1
+
             RT._draw(frame, face_boxes, name_tags, objs)
             ok, jpg = cv2.imencode(".jpg", frame, enc)
             if not ok:
@@ -331,6 +395,7 @@ def api_mjpg(ctx: dict, quality: int | str = 65, fps: float | str = 30.0, **_) -
             yield b"Content-Type: image/jpeg\r\n"
             yield b"Content-Length: " + str(len(blob)).encode("ascii") + b"\r\n\r\n"
             yield blob + b"\r\n"
+
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=--cam_boundary")
 
 def api_jpg(ctx: dict, quality: int | str = 65, **_) -> Response | Dict[str, object]:
@@ -340,12 +405,24 @@ def api_jpg(ctx: dict, quality: int | str = 65, **_) -> Response | Dict[str, obj
     frame = _read_frame()
     if frame is None:
         return {"ok": False, "error": "no frame"}
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    small = cv2.resize(gray, (0, 0), fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-    boxes_small = RT.cascade.detectMultiScale(small, scaleFactor=1.15, minNeighbors=4, minSize=(24, 24))
-    faces = [(int(x/0.5), int(y/0.5), int(w/0.5), int(h/0.5)) for (x, y, w, h) in boxes_small]
-    names = RT.recognize(frame, faces)
-    objs = RT.infer_objects(frame)
+
+    faces = []
+    names = []
+    objs = []
+    if RT.detect_faces:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        small = cv2.resize(gray, (0, 0), fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+        boxes_small = RT.cascade.detectMultiScale(small, scaleFactor=1.15, minNeighbors=4, minSize=(24, 24))
+        faces = [(int(x/0.5), int(y/0.5), int(w/0.5), int(h/0.5)) for (x, y, w, h) in boxes_small]
+        names = RT.recognize(frame, faces)
+    if RT.detect_objects:
+        objs = RT.infer_objects(frame)
+        with RT.lock:
+            RT.last_objects = [
+                {"label": name, "score": float(sc), "box": [int(x), int(y), int(w), int(h)]}
+                for (x, y, w, h, cid, sc, name) in objs
+            ]
+
     RT._draw(frame, faces, names, objs)
     ok, jpg = cv2.imencode(".jpg", frame, enc)
     if not ok:
@@ -355,6 +432,9 @@ def api_jpg(ctx: dict, quality: int | str = 65, **_) -> Response | Dict[str, obj
 def api_cam(ctx: dict, quality: int | str = 65, fps: float | str = 30.0, **_):
     return api_mjpg(ctx, quality=quality, fps=fps)
 
+# ---- Face enrollment helpers kept as-is ----
+PROFILE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
+
 class _EnrollState:
     def __init__(self):
         self.session_id: Optional[str] = None
@@ -362,10 +442,10 @@ class _EnrollState:
         self.samples: int = 0
         self.target: int = 10
         self.status: str = "idle"
-
 _EN = _EnrollState()
 
 def _analyze_frame(frame):
+    # unchanged; used by enrollment flow for activity 10
     if frame is None:
         return {"ready": False, "lighting": "low", "distance": "closer", "center_ok": False, "pose": "front"}
     RT.ensure_models()
@@ -433,7 +513,11 @@ def api_face_enroll_capture(ctx: dict, **_):
     crop = frame[max(0, y):y + h, max(0, x):x + w]
     if crop.size == 0:
         return {"ok": False, "error": "empty"}
-    vec = RT._embed_from_crop(crop)
+    g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    g = cv2.equalizeHist(g)
+    vec = cv2.resize(g, (32, 32), interpolation=cv2.INTER_AREA).astype("float32").reshape(-1)
+    vec = (vec - vec.mean()) / (vec.std() + 1e-6)
+    vec /= (np.linalg.norm(vec) + 1e-6)
     _EN.tmp_vecs.append(vec)
     _EN.samples += 1
     done = _EN.samples >= _EN.target
@@ -454,10 +538,4 @@ def api_face_enroll_commit(ctx: dict, name: str | None = None, **_):
     meta = {"id": pid, "name": str(name).strip(), "created": int(time.time() * 1000), "samples": int(len(_EN.tmp_vecs))}
     (DB_DIR / f"{pid}.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     np.save(DB_DIR / f"{pid}.npy", emb)
-    RT._load_profiles()
-    _EN.session_id = None
-    _EN.tmp_vecs = []
-    _EN.samples = 0
-    _EN.target = 10
-    _EN.status = "idle"
     return {"ok": True, "id": pid}
